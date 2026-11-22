@@ -15,7 +15,7 @@ Every event exposes these fields:
 | --- | --- | --- |
 | `network_id` | `str` | Application-owned identity of the logical network. |
 | `dev_eui` | `str` | Device identifier, normalized to 16 lowercase hexadecimal characters. |
-| `received_at` | `datetime` | Time of the event. Inventory events default to creation time in UTC. Activity events use the server receipt time. |
+| `received_at` | `datetime` | Event time. Inventory events default to creation time in UTC. Activity events generally use server receipt time; an initial observation may use a source-specific fallback. |
 | `type` | `EventType` | Fixed by the event class. |
 | `descriptor` | `DeviceDescriptor \| None` | Inventory metadata, when available. |
 
@@ -80,6 +80,10 @@ Each class adds the fields below to the [shared fields](#shared-fields).
 `received_at` is required. `descriptor` defaults to `None`. Supply either a
 descriptor or both `network_id` and `dev_eui`.
 
+Activity events have `is_initial: bool`, which defaults to `False`.
+Backends set it to `True` for initial observations. `DeviceCollection` does not
+deliver initial observations to device models.
+
 Backends convert SDK messages into these classes before delivery. Use the same
 classes for live events, tests, and capture replays.
 
@@ -88,6 +92,14 @@ classes for live events, tests, and capture replays.
 Raw application bytes received from a device. The device library decides which
 ports and byte layouts it supports. `data` retains the bytes without copying.
 Mutable SDK messages are not exposed.
+
+An initial observation has `is_initial=True` and empty `data`.
+It provides metadata only. Do not send it to a payload decoder.
+Observations are optional and may not be available from every backend.
+Compare timestamps per device and event type when retaining state. Initial and
+live events can arrive out of order. A fallback timestamp may not be the actual
+time of the reported data. See the [ChirpStack guide](/lorawan-connection/connection/chirpstack/#initial-observations)
+for its inventory status limitation.
 
 Fixed type: `EventType.UPLINK` (`"up"`).
 

@@ -7,7 +7,14 @@ from typing import cast, overload
 from .callbacks import Unsubscribe, notify, subscribe
 from .connection import Connection
 from .device import Device
-from .events import DeviceDescriptor, DeviceEvent, EventType
+from .events import (
+    AddedEvent,
+    DeviceDescriptor,
+    DeviceEvent,
+    EventType,
+    RemovedEvent,
+    UpdatedEvent,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -128,6 +135,9 @@ class DeviceCollection[DeviceT: Device]:
         """Consume descriptors before activity, never infer a model from data."""
         if self._closed:
             return
+        if not isinstance(event, (AddedEvent, UpdatedEvent, RemovedEvent)):
+            if event.is_initial:
+                return
         eui = event.dev_eui.replace(":", "").lower()
         if event.type == EventType.REMOVED:
             self._remove(eui)

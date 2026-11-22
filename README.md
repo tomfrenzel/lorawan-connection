@@ -104,7 +104,7 @@ replays a SenseCAP S2101 capture and prints 21.4 °C and 31.4% humidity.
 Adapters load only when explicitly imported. Both supply inventory before live
 activity. Collections select models by catalog identity. Provision devices on the
 server before connecting. The application owns connection startup, recovery, and shutdown;
-missed telemetry is not replayed. Calling `close()` on either backend releases
+missed telemetry payloads are not replayed. Calling `close()` on either backend releases
 resources without notifying disconnect listeners.
 
 ChirpStack inventory and discovery methods raise library authentication and
@@ -131,6 +131,17 @@ unsubscribe_disconnect = connection.on_disconnect(
 
 Omit `brands` or pass `None` to select all devices. Pass a set of `(stack, brand_id)`
 pairs to filter devices. Custom backends must default `brands` to `None`.
+
+Subscriptions include initial device metadata when the backend has it.
+ChirpStack uses retained events and inventory as sources. Its history read is
+bounded and may not read every retained record. Initial observations have
+`is_initial=True`. Initial uplinks have empty payloads. `DeviceCollection` does
+not send initial observations to device models. Other direct subscribers should
+check `is_initial` before passing activity to a payload decoder.
+Consumers that retain state should compare timestamps per device and event type.
+Initial, live, and older retained events can arrive out of order. ChirpStack can
+use the inventory last-seen time for fallback status and battery values. This time
+is not necessarily the time of the status report.
 
 Version 0.13 renames subscription parameters from `callback` to `listener`.
 Update keyword arguments and custom backend implementations to match.

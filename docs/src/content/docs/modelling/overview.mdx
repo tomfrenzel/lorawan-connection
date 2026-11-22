@@ -45,6 +45,7 @@ and stale-data rules. The collection does not impose them.
 The base device stores `StatusEvent` before calling your `handle_event()` method.
 It exposes battery percentage, external power, and the device's downlink SNR.
 Your handler does not need to call `super()` for status or acknowledgement handling.
+The collection does not deliver initial observations to device models.
 
 Read `device.battery_level`, `device.external_power_source`, and
 `device.downlink_margin`. These start as `None`. `device.latest_status` contains

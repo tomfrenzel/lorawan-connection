@@ -75,8 +75,15 @@ entry, preserving its ID and scope.
 
 ## Connect, register, and close
 
-Subscriptions use `async_subscribe(brands=..., listener=...)`. The initial
-replay must include all devices matching the requested brands.
+Use `async_subscribe(brands=..., listener=...)` to receive inventory and activity.
+Initial metadata is included when the backend provides it.
+The initial replay includes all matching devices. Retain the newest observation by
+timestamp for each device and event type because events can arrive out of order.
+Initial observations have `is_initial=True`. Initial uplinks have empty payloads.
+`DeviceCollection` filters initial observations before delivering events to models.
+A fallback timestamp may not be the actual report time. See the
+[ChirpStack guide](/lorawan-connection/connection/chirpstack/#initial-observations)
+for its inventory status limitation.
 
 Set `network_id=entry.entry_id` to distinguish identical DevEUIs on different servers.
 Pass a known management-console URL as `configuration_url` when registering.

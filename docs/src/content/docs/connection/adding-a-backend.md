@@ -50,7 +50,7 @@ class BackendContract(Protocol):
         brands: frozenset[tuple[str, int | str]] | None = None,
         listener: Callable[[DeviceEvent], None],
     ) -> Unsubscribe:
-        """Deliver matching inventory before returning, then deliver live events."""
+        """Deliver matching inventory, optional observations, and live events."""
         ...
 
     def on_disconnect(self, listener: Callable[[], None]) -> Unsubscribe:
@@ -140,6 +140,14 @@ Callbacks run synchronously on the owning event loop. Marshal SDK callbacks from
 other threads onto that loop. Use `notify()` to isolate subscriber exceptions.
 Return an independent, idempotent unsubscribe callback for every subscription.
 Unsubscribing one collection must not close the shared transport or other subscriptions.
+
+If the backend supports history, send initial observations to each subscriber.
+Set `is_initial=True` on each initial observation.
+Deliver each device's `ADDED` event first. Initial uplinks must have empty payloads.
+Do not let initial observations suppress live events for other subscribers.
+Document available sources and any timestamp limitations. Consumers compare
+timestamps per device and event type because initial and live events can arrive
+out of order.
 
 ## Translate messages and commands
 

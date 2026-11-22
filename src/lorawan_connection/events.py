@@ -52,6 +52,7 @@ class _Event:
     network_id: str = ""
     dev_eui: str = ""
     descriptor: DeviceDescriptor | None = None
+    is_initial: bool = False
 
     def __post_init__(self) -> None:
         if self.descriptor is not None:

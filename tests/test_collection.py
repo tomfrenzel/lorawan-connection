@@ -96,6 +96,39 @@ def test_all_activity_routes_by_identity(event: DeviceEvent) -> None:
     assert len(collection.devices[other.dev_eui].events) == 1
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        UplinkEvent(descriptor=DESCRIPTOR, received_at=NOW, data=b"", is_initial=True),
+        JoinEvent(
+            descriptor=DESCRIPTOR,
+            received_at=NOW,
+            dev_addr="12345678",
+            is_initial=True,
+        ),
+        StatusEvent(
+            descriptor=DESCRIPTOR,
+            received_at=NOW,
+            battery_level=50,
+            battery_level_unavailable=False,
+            is_initial=True,
+        ),
+    ],
+)
+def test_initial_observations_do_not_reach_device_models(event: DeviceEvent) -> None:
+    collection = Collection(MockConnection())
+    added = inventory()
+    collection.handle_event(added)
+    device = collection.devices[DESCRIPTOR.dev_eui]
+    collection.handle_event(event)
+    assert device.events == [added]
+    assert device.latest_status is None
+
+    live = replace(event, is_initial=False)
+    collection.handle_event(live)
+    assert device.events[-1] is live
+
+
 def test_unknown_activity_never_creates_a_device() -> None:
     collection = Collection(MockConnection())
     collection.handle_event(

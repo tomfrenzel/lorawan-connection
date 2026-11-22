@@ -26,7 +26,7 @@ class Connection(Protocol):
         brands: frozenset[tuple[str, int | str]] | None = None,
         listener: Callable[[DeviceEvent], None],
     ) -> Unsubscribe:
-        """Deliver inventory then live events. Select all devices by default."""
+        """Deliver inventory, optional observations, and live events."""
         ...
 
     def on_disconnect(self, listener: Callable[[], None]) -> Unsubscribe:

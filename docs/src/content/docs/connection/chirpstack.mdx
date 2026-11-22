@@ -55,7 +55,32 @@ devices discovered later.
 
 Keep the client and ChirpStack clocks synchronized. The filter uses the Redis event
 ID's timestamp. Clock differences can drop new events or admit retained ones. Missed
-telemetry is not recovered.
+telemetry payloads are not recovered.
+
+### Initial observations
+
+After inventory replay, each subscription reads retained events for its matching
+devices and receives the latest available uplink, join, and status metadata.
+Initial observations have `is_initial=True`; initial uplinks have `data=b""`.
+`DeviceCollection` filters these observations before delivery to device models,
+so historical payloads are not decoded.
+
+The latest uplink is selected by comparing retained history with inventory's
+last-seen time. Retained status always takes precedence over inventory status:
+inventory has no separate status timestamp. If no retained status is available,
+inventory status uses the last-seen time as an approximation. Its battery value
+is not a new reading, and an unavailable battery level remains unavailable.
+Inventory fallback requires a last-seen time; fallback status also requires
+inventory status.
+
+The history stream has no end-of-history marker. Reads stop after an idle timeout
+and apply total time and event limits. A pause or retention settings can leave
+history incomplete; reaching a hard limit discards that device's history and uses
+inventory fallback when available. Subscriptions wait at most 30 seconds for history.
+
+Live delivery remains unchanged and can overlap initial observations. Consumers
+that retain state should compare timestamps per device and event type, as Home
+Assistant does: events can arrive out of order or represent the same observation.
 
 ## API reference
 
@@ -68,7 +93,7 @@ poll_interval=30, channel=None)` owns its channel, including an injected test ch
 | `await applications()` | Return `{application_uuid: name}` for the selected tenant, or all accessible tenants when `tenant_id` is `None` (the default). |
 | `await inventory()` | Read descriptors without starting streams or updating the current device list. |
 | `await async_connect()` | Read existing devices and start polling and live events. |
-| `await async_subscribe(*, brands=None, listener)` | Report matching existing devices, then live events. Return an unsubscribe function. Omitted `brands` or `None` includes all devices. |
+| `await async_subscribe(*, brands=None, listener)` | Report matching existing devices, initial observations when available, and live events. Return an unsubscribe function. |
 | `on_disconnect(listener)` | Register a callback with no arguments. Return an unsubscribe function. |
 | `await async_send_downlink(downlink)` | Validate device scope and enqueue application bytes. Return the queue-item UUID. |
 | `await refresh()` | Refresh the connected device list. |
@@ -82,7 +107,7 @@ failures or device-list polling failures mark the connection unavailable. A reje
 key or access scope fails immediately. Live events continue while a device-list
 refresh is in progress.
 
-Events delivered before a collection subscribes are not buffered. The five-second
+Live events delivered before a collection subscribes are not buffered. The five-second
 leeway does not guarantee initial readings.
 
 Omit `brands` to discover all devices. Pass a set of stack and brand pairs to

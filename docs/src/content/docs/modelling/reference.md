@@ -35,6 +35,7 @@ mapping is empty and its `handle_event()` does nothing.
 The collection delivers events through an internal receive method. It stores
 `StatusEvent` and resolves acknowledgements before calling `handle_event()`.
 Overrides do not need to call `super().handle_event()`.
+The collection excludes initial observations, including initial status events.
 
 | Property | Type | Meaning |
 | --- | --- | --- |
@@ -130,9 +131,18 @@ The backend-neutral `Connection` protocol exposes:
 
 - `stack_type: str` identifies the catalog namespace. Each descriptor uses the same value in `stack`.
 
-- `async_subscribe(*, brands=None, listener) -> Unsubscribe` takes a `frozenset[tuple[str, int | str]]` or `None` and reports matching existing
-  devices before returning, then live events. Omitted `brands` or `None` selects all devices.
-  An empty set selects none. Arguments are keyword-only.
+- `async_subscribe(*, brands=None, listener) -> Unsubscribe`
+  reports matching existing devices and live events. `brands` is a
+  `frozenset[tuple[str, int | str]]` or `None`. Omitted `brands` or `None` selects
+  all devices. An empty set selects none. Arguments are keyword-only.
+  Initial metadata observations are delivered when the backend has them.
+  They have `is_initial=True`. Initial uplinks have empty `data`.
+  Do not pass initial observations to payload decoders.
+  `DeviceCollection` filters them before delivery to device models.
+  Compare timestamps per device and event type when retaining state because
+  initial and live events can arrive out of order. A fallback timestamp may not
+  be the actual report time. See the
+  [ChirpStack guide](/lorawan-connection/connection/chirpstack/#initial-observations).
 - `on_disconnect(listener) -> Unsubscribe` registers a notification callback with no arguments.
 - `async_send_downlink(downlink: Downlink) -> str` queues a command and returns its
   queue ID for internal ACK correlation.

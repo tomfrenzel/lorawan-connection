@@ -251,6 +251,218 @@ async def test_catalog_resolution(connection: ChirpStackConnection) -> None:
     await connection.close()
 
 
+async def test_invalid_inventory_last_seen_does_not_break_snapshot(
+    connection: ChirpStackConnection, caplog
+) -> None:
+    item = api.DeviceListItem(
+        dev_eui=DESCRIPTOR.dev_eui,
+        name="Greenhouse",
+        device_profile_id="profile",
+    )
+    item.last_seen_at.seconds = 999999999999
+    connection.applications = AsyncMock(return_value={"application": "Test"})
+    connection._device_api.List = AsyncMock(
+        return_value=api.ListDevicesResponse(total_count=1, result=[item])
+    )
+    connection._profile_api.Get = AsyncMock(
+        return_value=api.GetDeviceProfileResponse(device_profile=api.DeviceProfile())
+    )
+    result = await connection._snapshot()
+    assert DESCRIPTOR.dev_eui in result
+    assert DESCRIPTOR.dev_eui not in connection._inventory_latest
+    assert "invalid ChirpStack last-seen time" in caplog.text
+    await connection.close()
+
+
+async def test_history_reads_multiple_batches_beyond_500_events(
+    connection: ChirpStackConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read later pages instead of treating the oldest batch as the latest."""
+    monkeypatch.setattr(
+        "lorawan_connection.backend.chirpstack._HISTORY_IDLE_TIMEOUT", 0.1
+    )
+    message = integration.UplinkEvent(data=b"historical")
+    message.device_info.dev_eui = DESCRIPTOR.dev_eui
+    body = MessageToJson(message)
+
+    async def stream(*args, **kwargs):
+        for index in range(600):
+            if index in (200, 400):
+                await asyncio.sleep(0.01)
+            yield api.LogItem(id=f"{1000 + index}-0", description="up", body=body)
+
+    connection.devices = {DESCRIPTOR.dev_eui: DESCRIPTOR}
+    connection.available = True
+    connection._internal_api.StreamDeviceEvents = stream
+    events = []
+    await connection.async_subscribe(listener=events.append)
+    assert len(events) == 2
+    assert isinstance(events[1], UplinkEvent)
+    assert events[1].received_at == datetime.fromtimestamp(1.599, UTC)
+    assert events[1].data == b""
+    await connection.close()
+
+
+async def test_history_event_limit_does_not_report_old_batch_as_latest(
+    connection: ChirpStackConnection, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    monkeypatch.setattr("lorawan_connection.backend.chirpstack._HISTORY_MAX_EVENTS", 2)
+    message = integration.UplinkEvent(data=b"historical")
+    message.device_info.dev_eui = DESCRIPTOR.dev_eui
+    body = MessageToJson(message)
+
+    async def stream(*args, **kwargs):
+        for index in range(3):
+            yield api.LogItem(id=f"{1000 + index}-0", description="up", body=body)
+
+    connection.devices = {DESCRIPTOR.dev_eui: DESCRIPTOR}
+    connection.available = True
+    connection._internal_api.StreamDeviceEvents = stream
+    events = []
+    await connection.async_subscribe(listener=events.append)
+    assert [event.type for event in events] == [EventType.ADDED]
+    assert "exceeded the event limit" in caplog.text
+    await connection.close()
+
+
+async def test_history_does_not_decode_historical_payload(
+    connection: ChirpStackConnection,
+) -> None:
+    item = api.LogItem(
+        id="1000-0",
+        description="up",
+        body=(
+            '{"deviceInfo":{"devEui":"'
+            + DESCRIPTOR.dev_eui
+            + '"},"data":"not base64!","object":{"payload":"secret"},'
+            '"rxInfo":[{"gatewayId":"gateway","rssi":-42,"snr":5}]}'
+        ),
+    )
+    event = connection._parse_history_item(DESCRIPTOR, item)
+    assert isinstance(event, UplinkEvent)
+    assert event.data == b""
+    assert len(event.receptions) == 1
+    assert event.receptions[0].gateway_id == "gateway"
+    await connection.close()
+
+
+async def test_bad_history_items_do_not_hide_later_events(
+    connection: ChirpStackConnection,
+) -> None:
+    message = integration.JoinEvent(dev_addr="12345678")
+    message.device_info.dev_eui = DESCRIPTOR.dev_eui
+
+    async def stream(*args, **kwargs):
+        yield api.LogItem(id="1000-0", description="up", body="{")
+        yield api.LogItem(id="1001-0", description="unknown", body="{}")
+        yield api.LogItem(id="bad-id", description="join", body=MessageToJson(message))
+        yield api.LogItem(id="1002-0", description="join", body=MessageToJson(message))
+
+    connection._internal_api.StreamDeviceEvents = stream
+    observations = await connection._read_latest_observations(
+        DESCRIPTOR, datetime.now(UTC)
+    )
+    assert len(observations) == 1
+    assert observations[0].type == EventType.JOIN
+    assert observations[0].received_at == datetime.fromtimestamp(1.002, UTC)
+    await connection.close()
+
+
+async def test_history_is_not_delivered_after_disconnect(
+    connection: ChirpStackConnection,
+) -> None:
+    connection.devices = {DESCRIPTOR.dev_eui: DESCRIPTOR}
+    connection.available = True
+    started, finish = asyncio.Event(), asyncio.Event()
+    initial = UplinkEvent(
+        descriptor=DESCRIPTOR, received_at=datetime.now(UTC), data=b"", is_initial=True
+    )
+
+    async def read_history(*args):
+        started.set()
+        await finish.wait()
+        return (initial,)
+
+    connection._read_latest_observations = read_history
+    events = []
+    task = asyncio.create_task(connection.async_subscribe(listener=events.append))
+    await started.wait()
+    connection._failed(ConnectionUnavailable("disconnected"))
+    finish.set()
+    with pytest.raises(ConnectionUnavailable, match="closed during subscription"):
+        await task
+    assert [event.type for event in events] == [EventType.ADDED]
+    await connection.close()
+
+
+async def test_history_deadline_keeps_inventory_and_live_subscription(
+    connection: ChirpStackConnection, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    monkeypatch.setattr("lorawan_connection.backend.chirpstack._HISTORY_TIMEOUT", 0.1)
+    monkeypatch.setattr(
+        "lorawan_connection.backend.chirpstack._HISTORY_IDLE_TIMEOUT", 0.05
+    )
+    seen = datetime(2026, 1, 1, tzinfo=UTC)
+    fallback = UplinkEvent(
+        descriptor=DESCRIPTOR, received_at=seen, data=b"", is_initial=True
+    )
+    connection.devices = {DESCRIPTOR.dev_eui: DESCRIPTOR}
+    connection._inventory_latest = {DESCRIPTOR.dev_eui: (fallback,)}
+    connection.available = True
+    message = integration.UplinkEvent(data=b"payload")
+    message.device_info.dev_eui = DESCRIPTOR.dev_eui
+    body = MessageToJson(message)
+
+    async def stream(*args, **kwargs):
+        index = 0
+        while True:
+            await asyncio.sleep(0.01)
+            index += 1
+            yield api.LogItem(id=f"{1000 + index}-0", description="up", body=body)
+
+    connection._internal_api.StreamDeviceEvents = stream
+    events = []
+    unsubscribe = await connection.async_subscribe(listener=events.append)
+    assert [event.type for event in events] == [EventType.ADDED, EventType.UPLINK]
+    assert events[1] == fallback
+    assert "timed out" in caplog.text or "exceeded the time limit" in caplog.text
+    live = UplinkEvent(descriptor=DESCRIPTOR, received_at=datetime.now(UTC), data=b"x")
+    await connection.handle_activity(live)
+    assert events[-1] is live
+    unsubscribe()
+    await connection.close()
+
+
+async def test_live_event_in_subscription_millisecond_is_not_dropped(
+    connection: ChirpStackConnection,
+) -> None:
+    connection.devices = {DESCRIPTOR.dev_eui: DESCRIPTOR}
+    connection.available = True
+    now = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
+    initial = UplinkEvent(
+        descriptor=DESCRIPTOR,
+        received_at=now.replace(microsecond=123000) - timedelta(milliseconds=1),
+        data=b"",
+        is_initial=True,
+    )
+    connection._read_latest_observations = AsyncMock(return_value=(initial,))
+    events = []
+    with patch(
+        "lorawan_connection.backend.chirpstack.datetime", wraps=datetime
+    ) as clock:
+        clock.now.return_value = now
+        await connection.async_subscribe(listener=events.append)
+    live = replace(
+        initial,
+        received_at=now.replace(microsecond=123000),
+        data=b"live",
+        is_initial=False,
+    )
+    await connection.handle_activity(live)
+    assert events[-1] is live
+    await connection.close()
+
+
 @pytest.mark.parametrize("tenant_options", [{}, {"tenant_id": None}])
 async def test_applications_across_tenants(
     tenant_options: dict[str, str | None],

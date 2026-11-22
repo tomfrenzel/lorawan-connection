@@ -45,7 +45,7 @@ from lorawan_connection import DeviceEvent, EventType
 
 
 def handle_event(event: DeviceEvent) -> None:
-    if event.type == EventType.UPLINK:
+    if event.type == EventType.UPLINK and not event.is_initial:
         print(event.f_port, event.data.hex())
     elif event.type == EventType.ACK:
         print(event.queue_item_id, event.acknowledged)
@@ -56,6 +56,8 @@ which defaults to the current UTC time. Their identity properties read from the
 descriptor. Activity constructors require `received_at` and accept a descriptor or
 explicit network and device identifiers. Explicit identifiers must match a supplied
 descriptor. Construction normalizes DevEUIs and rejects invalid ones.
+Activity constructors accept `is_initial`, which defaults to `False`.
+Backends set it to `True` on initial metadata observations.
 
 Timestamps and radio ranges are not validated by the dataclasses. Backends provide
 timezone-aware timestamps. Device libraries validate wire formats and measurements.

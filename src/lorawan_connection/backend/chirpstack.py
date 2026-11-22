@@ -1,6 +1,7 @@
 """ChirpStack gRPC inventory plus live events behind one subscription."""
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,7 @@ from urllib.parse import urlsplit
 
 import grpc
 from chirpstack_api import api, integration
-from google.protobuf.json_format import Parse, ParseError
+from google.protobuf.json_format import Parse, ParseDict, ParseError
 from google.protobuf.message import Message
 
 from lorawan_connection import (
@@ -21,6 +22,7 @@ from lorawan_connection import (
     DeviceEvent,
     Downlink,
     DownlinkError,
+    EventType,
     GatewayReception,
     JoinEvent,
     LocationEvent,
@@ -37,6 +39,10 @@ from lorawan_connection import (
 from lorawan_connection._subscribers import Subscribers
 
 _LOGGER = logging.getLogger(__name__)
+_HISTORY_IDLE_TIMEOUT = 2.0
+_HISTORY_TIMEOUT = 30.0
+_HISTORY_MAX_EVENTS = 10000
+_HISTORY_CONCURRENCY = 10
 _MESSAGES = {
     "up": integration.UplinkEvent,
     "join": integration.JoinEvent,
@@ -142,7 +148,7 @@ class ChirpStackConnection:
 
     Callbacks are synchronous. close() must be awaited by the connection owner.
     A failure marks the connection unavailable before notifying the owner, which
-    can create a fresh connection. No replay/history contract is provided.
+    can create a fresh connection.
     """
 
     stack_type = "chirpstack"
@@ -191,6 +197,7 @@ class ChirpStackConnection:
         self._poller: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
         self._closed = False
+        self._inventory_latest: dict[str, tuple[DeviceEvent, ...]] = {}
         self._device_api = api.DeviceServiceStub(self.channel)
         self._profile_api = api.DeviceProfileServiceStub(self.channel)
         self._application_api = api.ApplicationServiceStub(self.channel)
@@ -305,6 +312,7 @@ class ChirpStackConnection:
         catalog_devices = {}
         vendors = {}
         snapshot = {}
+        inventory_latest: dict[str, tuple[DeviceEvent, ...]] = {}
         for application_id in self.application_ids:
             items = await self._list(
                 self._device_api.List,
@@ -359,7 +367,7 @@ class ChirpStackConnection:
                 catalog_id, vendor_id, model, manufacturer = profiles[
                     item.device_profile_id
                 ]
-                snapshot[item.dev_eui] = DeviceDescriptor(
+                descriptor = snapshot[item.dev_eui] = DeviceDescriptor(
                     self.network_id,
                     item.dev_eui,
                     item.name,
@@ -371,6 +379,41 @@ class ChirpStackConnection:
                     manufacturer,
                     stack=self.stack_type,
                 )
+                if item.HasField("last_seen_at"):
+                    try:
+                        received_at = item.last_seen_at.ToDatetime(tzinfo=UTC)
+                    except (ValueError, OverflowError, OSError):
+                        _LOGGER.warning(
+                            "Ignoring invalid ChirpStack last-seen time for %s",
+                            item.dev_eui,
+                        )
+                        continue
+                    observations: list[DeviceEvent] = [
+                        UplinkEvent(
+                            descriptor=descriptor,
+                            received_at=received_at,
+                            data=b"",
+                            is_initial=True,
+                        )
+                    ]
+                    if item.HasField("device_status"):
+                        observations.append(
+                            StatusEvent(
+                                descriptor=descriptor,
+                                received_at=received_at,
+                                is_initial=True,
+                                margin=item.device_status.margin,
+                                external_power_source=(
+                                    item.device_status.external_power_source
+                                ),
+                                battery_level_unavailable=(
+                                    item.device_status.battery_level < 0
+                                ),
+                                battery_level=max(item.device_status.battery_level, 0),
+                            )
+                        )
+                    inventory_latest[item.dev_eui] = tuple(observations)
+        self._inventory_latest = inventory_latest
         return snapshot
 
     def _emit(
@@ -427,11 +470,186 @@ class ChirpStackConnection:
         brands: frozenset[tuple[str, int | str]] | None = None,
         listener: Callable[[DeviceEvent], None],
     ) -> Unsubscribe:
-        """Deliver matching inventory, then live events. None selects all vendors."""
+        """Deliver matching inventory, initial observations, then live events."""
         if not self.available or self._closed:
             raise ConnectionUnavailable("Connection is not available")
-        return self._subscribers.add(
+        now = datetime.now(UTC)
+        # Redis IDs have millisecond precision; exclude current live events.
+        cutoff = now.replace(microsecond=now.microsecond // 1000 * 1000)
+        unsubscribe = self._subscribers.add(
             brands, listener, replay=tuple(self.devices.values())
+        )
+
+        try:
+            await self._deliver_latest_observations(brands, listener, cutoff)
+            if not self.available or self._closed:
+                raise ConnectionUnavailable("Connection closed during subscription")
+        except BaseException:
+            unsubscribe()
+            raise
+        return unsubscribe
+
+    async def _deliver_latest_observations(
+        self,
+        brands: frozenset[tuple[str, int | str]] | None,
+        listener: Callable[[DeviceEvent], None],
+        cutoff: datetime,
+    ) -> None:
+        """Read bounded history and deliver it only to this subscriber."""
+        semaphore = asyncio.Semaphore(_HISTORY_CONCURRENCY)
+        descriptors = tuple(
+            descriptor
+            for descriptor in self.devices.values()
+            if brands is None or (descriptor.stack, descriptor.brand_id) in brands
+        )
+        completed: set[str] = set()
+
+        def deliver(
+            descriptor: DeviceDescriptor, history: tuple[DeviceEvent, ...]
+        ) -> None:
+            completed.add(descriptor.dev_eui)
+            inventory_observations = self._inventory_latest.get(descriptor.dev_eui, ())
+            observations_by_type = {
+                event.type: event for event in inventory_observations
+            }
+            for event in history:
+                previous = observations_by_type.get(event.type)
+                if (
+                    previous is None
+                    or event.type == EventType.STATUS
+                    or event.received_at >= previous.received_at
+                ):
+                    observations_by_type[event.type] = event
+            for event in observations_by_type.values():
+                if self._closed or self.devices.get(descriptor.dev_eui) != descriptor:
+                    return
+                notify([listener], event)
+
+        async def read(descriptor: DeviceDescriptor) -> None:
+            try:
+                async with semaphore:
+                    history = await self._read_latest_observations(descriptor, cutoff)
+            except Exception:
+                _LOGGER.exception(
+                    "Could not read ChirpStack history for %s", descriptor.dev_eui
+                )
+                history = ()
+            deliver(descriptor, history)
+
+        try:
+            async with asyncio.timeout(_HISTORY_TIMEOUT):
+                await asyncio.gather(*(read(descriptor) for descriptor in descriptors))
+        except TimeoutError:
+            _LOGGER.warning(
+                "ChirpStack history timed out for %d devices",
+                len(descriptors) - len(completed),
+            )
+            for descriptor in descriptors:
+                if descriptor.dev_eui not in completed:
+                    deliver(descriptor, ())
+
+    async def _read_latest_observations(
+        self, descriptor: DeviceDescriptor, cutoff: datetime
+    ) -> tuple[DeviceEvent, ...]:
+        """Read at most the newest uplink, join, and status from Redis-backed events."""
+        latest: dict[EventType, DeviceEvent] = {}
+        stream = self._internal_api.StreamDeviceEvents(
+            api.StreamDeviceEventsRequest(dev_eui=descriptor.dev_eui),
+            metadata=self.metadata,
+        )
+        iterator = aiter(stream)
+        try:
+            async with asyncio.timeout(_HISTORY_TIMEOUT):
+                for _ in range(_HISTORY_MAX_EVENTS):
+                    try:
+                        async with asyncio.timeout(_HISTORY_IDLE_TIMEOUT):
+                            item = await anext(iterator)
+                    except (TimeoutError, StopAsyncIteration):
+                        break
+                    event = self._parse_history_item(descriptor, item)
+                    del item
+                    if event is None or event.received_at >= cutoff:
+                        continue
+                    previous = latest.get(event.type)
+                    # ChirpStack streams Redis records oldest-first, including ties.
+                    if previous is None or event.received_at >= previous.received_at:
+                        latest[event.type] = event
+                else:
+                    _LOGGER.warning(
+                        "ChirpStack history for %s exceeded the event limit",
+                        descriptor.dev_eui,
+                    )
+                    return ()
+        except TimeoutError:
+            _LOGGER.warning(
+                "ChirpStack history for %s exceeded the time limit",
+                descriptor.dev_eui,
+            )
+            return ()
+        except (grpc.RpcError, ConnectionUnavailable) as error:
+            _LOGGER.warning(
+                "Ignoring ChirpStack history for %s: %s", descriptor.dev_eui, error
+            )
+            return ()
+        finally:
+            if isinstance(stream, grpc.aio.UnaryStreamCall):
+                stream.cancel()
+            elif hasattr(iterator, "aclose"):
+                await iterator.aclose()
+        return tuple(latest.values())
+
+    def _parse_history_item(
+        self, descriptor: DeviceDescriptor, item: object
+    ) -> DeviceEvent | None:
+        """Convert one bounded history item without retaining an uplink payload."""
+        kind = getattr(item, "description", "")
+        message_class = _MESSAGES.get(kind)
+        if kind not in ("up", "join", "status") or message_class is None:
+            return None
+        try:
+            redis_id = getattr(item, "id", "")
+            recorded_at = datetime.fromtimestamp(
+                int(redis_id.split("-", 1)[0]) / 1000, UTC
+            )
+            body = json.loads(getattr(item, "body", ""))
+            if not isinstance(body, dict):
+                return None
+            if kind == "up":
+                body.pop("data", None)
+                body.pop("object", None)
+            message = ParseDict(body, message_class(), ignore_unknown_fields=True)
+        except (ValueError, TypeError, OverflowError, OSError, ParseError):
+            return None
+        if message.device_info.dev_eui.lower() != descriptor.dev_eui.lower():
+            return None
+
+        if kind == "up":
+            return UplinkEvent(
+                descriptor=descriptor,
+                received_at=recorded_at,
+                data=b"",
+                is_initial=True,
+                f_port=message.f_port,
+                receptions=tuple(
+                    GatewayReception(rx.gateway_id, rx.rssi, rx.snr)
+                    for rx in message.rx_info
+                ),
+            )
+        if kind == "join":
+            return JoinEvent(
+                descriptor=descriptor,
+                received_at=recorded_at,
+                dev_addr=message.dev_addr,
+                is_initial=True,
+            )
+        return StatusEvent(
+            descriptor=descriptor,
+            received_at=recorded_at,
+            is_initial=True,
+            margin=message.margin,
+            external_power_source=message.external_power_source,
+            battery_level_unavailable=message.battery_level_unavailable,
+            battery_level=message.battery_level,
         )
 
     def on_disconnect(self, listener: Callable[[], None]) -> Unsubscribe:
