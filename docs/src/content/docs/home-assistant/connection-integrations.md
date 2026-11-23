@@ -75,8 +75,11 @@ entry, preserving its ID and scope.
 
 ## Connect, register, and close
 
-Subscriptions use `async_subscribe(brands=..., listener=...)`. The initial
-replay must include all devices matching the requested brands.
+The shared integration uses `async_subscribe_with_history(brands=..., listener=...)`
+when the backend provides it. This initializes the device overview and vendor models
+from [retained ChirpStack observations](/lorawan-connection/connection/chirpstack/#last-known-readings).
+Other backends use `async_subscribe(brands=..., listener=...)`. Both methods must
+deliver all matching device descriptors before readings.
 
 Set `network_id=entry.entry_id` to distinguish identical DevEUIs on different servers.
 Pass a known management-console URL as `configuration_url` when registering.

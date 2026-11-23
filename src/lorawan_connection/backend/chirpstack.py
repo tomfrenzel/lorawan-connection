@@ -21,6 +21,7 @@ from lorawan_connection import (
     DeviceEvent,
     Downlink,
     DownlinkError,
+    EventType,
     GatewayReception,
     JoinEvent,
     LocationEvent,
@@ -37,6 +38,8 @@ from lorawan_connection import (
 from lorawan_connection._subscribers import Subscribers
 
 _LOGGER = logging.getLogger(__name__)
+type _Observation = UplinkEvent | JoinEvent | StatusEvent
+_OBSERVATIONS = (UplinkEvent, JoinEvent, StatusEvent)
 _MESSAGES = {
     "up": integration.UplinkEvent,
     "join": integration.JoinEvent,
@@ -142,7 +145,7 @@ class ChirpStackConnection:
 
     Callbacks are synchronous. close() must be awaited by the connection owner.
     A failure marks the connection unavailable before notifying the owner, which
-    can create a fresh connection. No replay/history contract is provided.
+    can create a fresh connection. Retained observations are opt-in.
     """
 
     stack_type = "chirpstack"
@@ -185,6 +188,8 @@ class ChirpStackConnection:
         self.available = False
         self.error: Exception | None = None
         self._subscribers = Subscribers()
+        self._history_subscribers = Subscribers()
+        self._latest: dict[str, dict[EventType, tuple[int, _Observation]]] = {}
         self._disconnect_listeners: list[Callable[[None], None]] = []
         self._connecting = False
         self._streams: dict[str, asyncio.Task[None]] = {}
@@ -376,9 +381,9 @@ class ChirpStackConnection:
     def _emit(
         self, event: DeviceEvent, previous: DeviceDescriptor | None = None
     ) -> None:
-        self._subscribers.deliver(
-            event, event.descriptor or self.devices.get(event.dev_eui), previous
-        )
+        descriptor = event.descriptor or self.devices.get(event.dev_eui)
+        self._subscribers.deliver(event, descriptor, previous)
+        self._history_subscribers.deliver(event, descriptor, previous)
 
     @_translate_rpc_errors
     async def refresh(self) -> None:
@@ -391,6 +396,7 @@ class ChirpStackConnection:
             self.devices = snapshot
             for eui, descriptor in old.items():
                 if eui not in snapshot:
+                    self._latest.pop(eui, None)
                     if (
                         task := self._streams.pop(eui, None)
                     ) is not None and task is not asyncio.current_task():
@@ -399,8 +405,15 @@ class ChirpStackConnection:
             for eui, descriptor in snapshot.items():
                 if eui not in old:
                     self._emit(AddedEvent(descriptor=descriptor))
-                elif old[eui] != descriptor:
-                    self._emit(UpdatedEvent(descriptor=descriptor), old[eui])
+                elif (previous := old[eui]) != descriptor:
+                    if (
+                        previous.application_id != descriptor.application_id
+                        or previous.profile_id != descriptor.profile_id
+                        or previous.model_id != descriptor.model_id
+                        or previous.brand_id != descriptor.brand_id
+                    ):
+                        self._latest.pop(eui, None)
+                    self._emit(UpdatedEvent(descriptor=descriptor), previous)
                 if eui not in self._streams:
                     self._streams[eui] = asyncio.create_task(self._stream(eui))
 
@@ -434,6 +447,37 @@ class ChirpStackConnection:
             brands, listener, replay=tuple(self.devices.values())
         )
 
+    def get_latest_events(self, dev_eui: str) -> tuple[_Observation, ...]:
+        """Return the latest uplink, join and status read so far, oldest first."""
+        if not self.available or self._closed:
+            raise ConnectionUnavailable("Connection is not available")
+        dev_eui = dev_eui.replace(":", "").lower()
+        if dev_eui not in self.devices:
+            raise KeyError(dev_eui)
+        return tuple(
+            event
+            for _, event in sorted(
+                self._latest.get(dev_eui, {}).values(),
+                key=lambda item: (item[1].received_at, item[0]),
+            )
+        )
+
+    async def async_subscribe_with_history(
+        self,
+        *,
+        brands: frozenset[tuple[str, int | str]] | None = None,
+        listener: Callable[[DeviceEvent], None],
+    ) -> Unsubscribe:
+        """Deliver inventory, latest observations, then retained and live updates."""
+        if not self.available or self._closed:
+            raise ConnectionUnavailable("Connection is not available")
+        return self._history_subscribers.add(
+            brands,
+            listener,
+            replay=tuple(self.devices.values()),
+            history=self.get_latest_events,
+        )
+
     def on_disconnect(self, listener: Callable[[], None]) -> Unsubscribe:
         """Notify after connection loss. Callers own recovery."""
         if self._closed:
@@ -442,6 +486,8 @@ class ChirpStackConnection:
 
     def _notify_disconnect(self) -> None:
         self._subscribers.clear()
+        self._history_subscribers.clear()
+        self._latest.clear()
         listeners, self._disconnect_listeners = self._disconnect_listeners, []
         notify(listeners, None)
         listeners.clear()
@@ -487,9 +533,10 @@ class ChirpStackConnection:
         failures = 0
         while not self._closed and dev_eui in self.devices:
             try:
-                async for event in self._read_stream(dev_eui):
-                    failures = 0
-                    await self.handle_activity(event)
+                async for event, sequence, retained in self._read_stream(dev_eui):
+                    if not retained:
+                        failures = 0
+                    self._deliver_activity(event, sequence=sequence, retained=retained)
             except (grpc.RpcError, ConnectionUnavailable) as error:
                 if (
                     isinstance(error, grpc.RpcError)
@@ -522,8 +569,9 @@ class ChirpStackConnection:
             else:
                 return
 
-    async def _read_stream(self, dev_eui: str) -> AsyncIterator[DeviceEvent]:
-        # Remove this filter when ChirpStack supports disabling retained events.
+    async def _read_stream(
+        self, dev_eui: str
+    ) -> AsyncIterator[tuple[DeviceEvent, int, bool]]:
         cutoff = datetime.now(UTC) - timedelta(seconds=5)
         async for item in self._internal_api.StreamDeviceEvents(
             api.StreamDeviceEventsRequest(dev_eui=dev_eui), metadata=self.metadata
@@ -531,20 +579,34 @@ class ChirpStackConnection:
             message_class = _MESSAGES.get(item.description)
             if message_class is None:
                 continue
+            event_class, fields = _EVENTS[item.description]
             # Redis IDs reflect receipt at the server, unlike sensor clocks.
             try:
-                recorded_at = datetime.fromtimestamp(
-                    int(item.id.split("-", 1)[0]) / 1000, UTC
-                )
-                if recorded_at < cutoff:
+                millis, suffix = item.id.split("-", 1)
+                recorded_at = datetime.fromtimestamp(int(millis) / 1000, UTC)
+                sequence = int(suffix)
+                retained = recorded_at < cutoff
+                if retained and event_class not in _OBSERVATIONS:
                     continue
                 message = Parse(item.body, message_class(), ignore_unknown_fields=True)
             except (ValueError, OverflowError, OSError, ParseError):
                 _LOGGER.warning("Ignoring malformed ChirpStack event for %s", dev_eui)
                 continue
-            if message.device_info.dev_eui.lower() != dev_eui.lower():
+            info = message.device_info
+            if info.dev_eui.lower() != dev_eui.lower():
                 continue
-            event_class, fields = _EVENTS[item.description]
+            descriptor = self.devices.get(dev_eui)
+            if descriptor is not None and (
+                (
+                    info.application_id
+                    and info.application_id != descriptor.application_id
+                )
+                or (
+                    info.device_profile_id
+                    and info.device_profile_id != descriptor.profile_id
+                )
+            ):
+                continue
             payload = message.location if item.description == "location" else message
             values = {name: getattr(payload, name) for name in fields}
             if item.description == "up":
@@ -552,29 +614,51 @@ class ChirpStackConnection:
                     GatewayReception(rx.gateway_id, rx.rssi, rx.snr)
                     for rx in message.rx_info
                 )
-            yield event_class(
+            event = event_class(
                 network_id=self.network_id,
                 dev_eui=dev_eui,
                 received_at=recorded_at,
                 **values,
             )
+            yield event, sequence, retained
         if dev_eui in self.devices:
             raise ConnectionUnavailable("ChirpStack event stream closed")
 
     async def handle_activity(self, event: DeviceEvent) -> None:
         """Deliver activity for known devices without waiting on inventory polling."""
-        if (
-            not self._closed
-            and event.network_id == self.network_id
-            and event.dev_eui in self.devices
-        ):
+        self._deliver_activity(event, sequence=0, retained=False)
+
+    def _deliver_activity(
+        self, event: DeviceEvent, *, sequence: int, retained: bool
+    ) -> None:
+        if self._closed or event.network_id != self.network_id:
+            return
+        descriptor = self.devices.get(event.dev_eui)
+        if descriptor is None:
+            return
+        if not isinstance(event, _OBSERVATIONS):
             self._emit(event)
+            return
+
+        latest = self._latest.setdefault(event.dev_eui, {})
+        previous = latest.get(event.type)
+        # A restarted stream begins at the oldest retained Redis ID again.
+        if previous is None or (event.received_at, sequence) > (
+            previous[1].received_at,
+            previous[0],
+        ):
+            latest[event.type] = (sequence, event)
+            self._history_subscribers.deliver(event, descriptor)
+        if not retained:
+            self._subscribers.deliver(event, descriptor)
 
     async def close(self) -> None:
         """Cancel streams and polls, await cleanup, and close the channel."""
         self.available = False
         self._closed = True
         self._subscribers.clear()
+        self._history_subscribers.clear()
+        self._latest.clear()
         self._disconnect_listeners.clear()
         tasks = [
             task

@@ -26,15 +26,23 @@ class Subscribers:
         listener: Callable[[DeviceEvent], None],
         *,
         replay: Iterable[DeviceDescriptor] = (),
+        history: Callable[[str], Iterable[DeviceEvent]] | None = None,
     ) -> Unsubscribe:
-        """Register one listener, replay matching inventory, and return cleanup."""
+        """Replay matching inventory before any requested observations."""
         subscriber = _Subscriber(brands, listener)
         self._items.append(subscriber)
+        observations: list[DeviceEvent] = []
         for descriptor in replay:
             if subscriber not in self._items:
                 break
             if brands is None or (descriptor.stack, descriptor.brand_id) in brands:
+                if history is not None:
+                    observations.extend(history(descriptor.dev_eui))
                 notify([listener], AddedEvent(descriptor=descriptor))
+        for event in observations:
+            if subscriber not in self._items:
+                break
+            notify([listener], event)
 
         def unsubscribe() -> None:
             if subscriber in self._items:

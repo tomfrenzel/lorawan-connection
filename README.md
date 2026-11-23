@@ -103,8 +103,8 @@ replays a SenseCAP S2101 capture and prints 21.4 °C and 31.4% humidity.
 
 Adapters load only when explicitly imported. Both supply inventory before live
 activity. Collections select models by catalog identity. Provision devices on the
-server before connecting. The application owns connection startup, recovery, and shutdown;
-missed telemetry is not replayed. Calling `close()` on either backend releases
+server before connecting. The application owns connection startup, recovery, and shutdown.
+Default subscriptions do not replay missed telemetry. Calling `close()` on either backend releases
 resources without notifying disconnect listeners.
 
 ChirpStack inventory and discovery methods raise library authentication and
@@ -135,9 +135,16 @@ pairs to filter devices. Custom backends must default `brands` to `None`.
 Version 0.13 renames subscription parameters from `callback` to `listener`.
 Update keyword arguments and custom backend implementations to match.
 
-ChirpStack drops retained events older than five seconds before each device stream
-starts. Keep server and client clocks synchronized. TTS supports separate Identity
-and Application Servers.
+ChirpStack's live subscription skips retained events older than five seconds at
+stream startup. To show readings without waiting for the next uplink, use
+`await connection.async_subscribe_with_history(listener=...)` instead. On a
+connected ChirpStack backend, `connection.get_latest_events(dev_eui)` returns
+the latest known uplink, join, and status as a tuple. It can be empty while the
+server's retained events are arriving. See the
+[ChirpStack guide](https://home-assistant-libs.github.io/lorawan-connection/connection/chirpstack/#last-known-readings).
+
+Keep server and client clocks synchronized. TTS supports separate Identity and
+Application Servers.
 
 ## Sending commands
 

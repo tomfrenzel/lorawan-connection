@@ -14,6 +14,9 @@ from google.protobuf.message import Message
 from lorawan_connection import (
     AddedEvent,
     EventType,
+    GatewayReception,
+    JoinEvent,
+    StatusEvent,
     UplinkEvent,
 )
 from lorawan_connection.backend.chirpstack import (
@@ -145,7 +148,7 @@ async def test_stream_decode_replay_and_disconnect(
     message: Message,
     stream_start_delay: int,
 ) -> None:
-    """Allow five seconds of history at each stream start. Drop older records."""
+    """The live subscription allows five seconds of history at each stream start."""
     now = datetime.now(UTC).replace(microsecond=0) + timedelta(
         seconds=stream_start_delay
     )
@@ -194,8 +197,10 @@ async def test_stream_decode_replay_and_disconnect(
     ) as clock:
         clock.now.return_value = now
         with pytest.raises(ConnectionUnavailable, match="stream closed"):
-            async for event in connection._read_stream(DESCRIPTOR.dev_eui):
-                await connection.handle_activity(event)
+            async for event, seq, retained in connection._read_stream(
+                DESCRIPTOR.dev_eui
+            ):
+                connection._deliver_activity(event, sequence=seq, retained=retained)
     assert listener.call_count == 3
     assert [call.args[0].received_at for call in listener.call_args_list] == [
         now - timedelta(seconds=5),
@@ -213,6 +218,120 @@ async def test_stream_decode_replay_and_disconnect(
     connection._failed(ConnectionUnavailable())
     disconnected.assert_called_once()
     await connection.close()
+
+
+async def test_retained_observations(connection: ChirpStackConnection) -> None:
+    """A quiet device supplies readings to early and late history subscribers only."""
+    eui = DESCRIPTOR.dev_eui
+    info = {"dev_eui": eui, "application_id": DESCRIPTOR.application_id}
+    uplink = integration.UplinkEvent(
+        device_info=info,
+        data=PAYLOAD,
+        f_port=2,
+        rx_info=[{"gateway_id": "roof", "rssi": -81, "snr": 3.5}],
+    )
+    join = integration.JoinEvent(device_info=info, dev_addr="01020304")
+    status = integration.StatusEvent(device_info=info, battery_level=42)
+    records: asyncio.Queue[api.LogItem] = asyncio.Queue()
+
+    async def stream(request, **kwargs):
+        assert request.dev_eui == eui
+        while True:
+            yield await records.get()
+            records.task_done()
+
+    def enqueue(kind, message, sequence):
+        records.put_nowait(
+            api.LogItem(
+                id=f"1700000000000-{sequence}",
+                description=kind,
+                body=MessageToJson(message),
+            )
+        )
+
+    connection._internal_api.StreamDeviceEvents = Mock(side_effect=stream)
+    connection._snapshot = AsyncMock(return_value={eui: DESCRIPTOR})
+    try:
+        await connection.async_connect()
+        live, early, late, other_brand = [], [], [], []
+        await connection.async_subscribe(listener=live.append)
+        unsubscribe = await connection.async_subscribe_with_history(
+            listener=early.append
+        )
+        assert connection.get_latest_events(eui) == ()
+        enqueue("up", integration.UplinkEvent(device_info=info, data=b"old"), 1)
+        enqueue("join", join, 2)
+        enqueue("status", status, 3)
+        enqueue("up", uplink, 10)
+        enqueue("ack", integration.AckEvent(device_info=info, acknowledged=True), 11)
+        # The same DevEUI can have retained records from a previous application.
+        uplink.device_info.application_id = "another-app"
+        enqueue("up", uplink, 12)
+        async with asyncio.timeout(2):
+            await records.join()
+
+        assert [event.type for event in live] == [EventType.ADDED]
+        assert [event.type for event in early] == [
+            EventType.ADDED,
+            EventType.UPLINK,
+            EventType.JOIN,
+            EventType.STATUS,
+            EventType.UPLINK,
+        ]
+        at = datetime.fromtimestamp(1700000000, UTC)
+        identity = {"network_id": "network", "dev_eui": eui, "received_at": at}
+        history = (
+            JoinEvent(**identity, dev_addr="01020304"),
+            StatusEvent(**identity, battery_level=42, battery_level_unavailable=False),
+            UplinkEvent(
+                **identity,
+                data=PAYLOAD,
+                f_port=2,
+                receptions=(GatewayReception("roof", -81, 3.5),),
+            ),
+        )
+        assert connection.get_latest_events(eui) == history
+        await connection.async_subscribe_with_history(listener=late.append)
+        await connection.async_subscribe_with_history(
+            brands=frozenset({("chirpstack", 999)}), listener=other_brand.append
+        )
+        assert late[0].type == EventType.ADDED
+        assert tuple(late[1:]) == history
+        assert other_brand == []
+        unsubscribe()
+
+        # A retry can return the same IDs, including several in one millisecond.
+        enqueue("join", join, 2)
+        uplink.device_info.application_id = DESCRIPTOR.application_id
+        enqueue("up", uplink, 10)
+        records.put_nowait(
+            api.LogItem(
+                id=f"{int(datetime.now(UTC).timestamp() * 1000)}-0",
+                description="up",
+                body=MessageToJson(uplink),
+            )
+        )
+        async with asyncio.timeout(2):
+            await records.join()
+        assert [event.type for event in live] == [EventType.ADDED, EventType.UPLINK]
+        assert late[1:] == [*history, live[-1]]
+        assert early[-1] == history[-1]
+        assert other_brand == []
+        connection._internal_api.StreamDeviceEvents.assert_called_once()
+
+        connection._snapshot.return_value = {}
+        await connection.refresh()
+        with pytest.raises(KeyError):
+            connection.get_latest_events(eui)
+        connection._snapshot.return_value = {eui: DESCRIPTOR}
+        await connection.refresh()
+        assert connection.get_latest_events(eui) == ()
+    finally:
+        await connection.close()
+    with pytest.raises(ConnectionUnavailable):
+        await connection.async_subscribe_with_history(listener=late.append)
+    with pytest.raises(ConnectionUnavailable):
+        connection.get_latest_events(eui)
 
 
 async def test_catalog_resolution(connection: ChirpStackConnection) -> None:

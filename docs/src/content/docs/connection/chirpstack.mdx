@@ -48,14 +48,46 @@ Newly observed devices receive an `ADDED` event before their activity is deliver
 
 The internal API is a compatibility dependency, tested against ChirpStack 4.19.2 and
 Python bindings 4.19.0. It requires device event retention to be enabled. ChirpStack can
-send retained events when a stream opens, followed by live events. The backend records
-the local time before opening each device stream. It accepts server receipt timestamps
-at or after that time minus five seconds and drops older events. This also applies to
-devices discovered later.
+send retained events when a stream opens, followed by live events. The live subscription
+accepts server receipt timestamps at or after stream startup minus five seconds.
+This also applies to devices discovered later.
 
 Keep the client and ChirpStack clocks synchronized. The filter uses the Redis event
-ID's timestamp. Clock differences can drop new events or admit retained ones. Missed
-telemetry is not recovered.
+ID's timestamp. Clock differences can drop new events or admit retained ones.
+
+## Last known readings
+
+Use `async_subscribe_with_history()` instead of `async_subscribe()` to initialize
+a display without waiting for a device to transmit again:
+
+```python
+from lorawan_connection import DeviceEvent, UplinkEvent
+
+
+def show_reading(event: DeviceEvent) -> None:
+    if isinstance(event, UplinkEvent):
+        print(event.dev_eui, event.received_at, event.f_port, event.data.hex())
+
+
+unsubscribe = await connection.async_subscribe_with_history(listener=show_reading)
+```
+
+The listener receives matching inventory first. It then receives the latest known
+uplink, join, and status per device, followed by updates. Retained observations
+keep their server timestamps. Do not treat an old reading as a new transmission.
+Older acknowledgements, logs and other activity are not replayed.
+
+To read the current snapshot once, call `connection.get_latest_events(dev_eui)`.
+It returns at most one event of each of the three types, oldest first. It does not
+make a network request or reconstruct measurements from earlier payloads.
+
+Both methods use the device streams opened by `async_connect()`. ChirpStack sends
+retained records oldest first and does not signal the end of the backlog. A snapshot
+can therefore be empty or partial just after connection. The subscription delivers
+remaining observations as they arrive, even if the device sends no new uplink.
+Data that ChirpStack no longer retains cannot be recovered from the server.
+Check `monitoring.per_device_event_log_max_history` and `monitoring.per_device_event_log_ttl`
+on your server if no previous reading appears.
 
 ## API reference
 
@@ -69,6 +101,8 @@ poll_interval=30, channel=None)` owns its channel, including an injected test ch
 | `await inventory()` | Read descriptors without starting streams or updating the current device list. |
 | `await async_connect()` | Read existing devices and start polling and live events. |
 | `await async_subscribe(*, brands=None, listener)` | Report matching existing devices, then live events. Return an unsubscribe function. Omitted `brands` or `None` includes all devices. |
+| `await async_subscribe_with_history(*, brands=None, listener)` | Include retained uplink, join, and status observations. Use the same brand filter and unsubscribe function as the live subscription. |
+| `get_latest_events(dev_eui)` | Return a tuple of observations read so far. An empty tuple means none are known. An unknown DevEUI raises `KeyError`. |
 | `on_disconnect(listener)` | Register a callback with no arguments. Return an unsubscribe function. |
 | `await async_send_downlink(downlink)` | Validate device scope and enqueue application bytes. Return the queue-item UUID. |
 | `await refresh()` | Refresh the connected device list. |
@@ -82,8 +116,9 @@ failures or device-list polling failures mark the connection unavailable. A reje
 key or access scope fails immediately. Live events continue while a device-list
 refresh is in progress.
 
-Events delivered before a collection subscribes are not buffered. The five-second
-leeway does not guarantee initial readings.
+The default subscription does not replay observations from before subscription.
+The five-second leeway does not guarantee initial readings. Both subscription
+methods and `get_latest_events()` require an available connection.
 
 Omit `brands` to discover all devices. Pass a set of stack and brand pairs to
 filter devices. These options also apply to the `Connection` protocol and `MockConnection`.

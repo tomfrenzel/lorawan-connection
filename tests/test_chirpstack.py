@@ -91,7 +91,9 @@ async def test_event_conversion(kind, message, fields) -> None:
         channel=Mock(close=AsyncMock()),
     )
     connection._internal_api.StreamDeviceEvents = stream
-    events = [event async for event in connection._read_stream(DESCRIPTOR.dev_eui)]
+    events = [
+        event async for event, _, _ in connection._read_stream(DESCRIPTOR.dev_eui)
+    ]
     assert len(events) == 1
     event = events[0]
     assert event.type is EventType(kind)
